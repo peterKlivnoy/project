@@ -1,0 +1,105 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+\title{Part II Writeup: MCMC Substitution Cipher Decoder}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section{High-Level Overview of the Decoding Algorithm}
+
+The core of our decoding engine is formulated as an optimization problem: we seek the maximum a posteriori (MAP) estimate of the substitution cipher key $f$ given the observed ciphertext $y$. Let $\Omega$ denote the state space of all possible permutations of our 28-character alphabet ($|\Omega| = 28!$). By Bayes' Theorem, the posterior distribution of the key is given by:
+\begin{equation}
+    P(f \mid y) = \frac{P(y \mid f)P(f)}{P(y)} \propto P(y \mid f)P(f)
+\end{equation}
+
+Assuming a uniform prior $P(f)$ over all possible cipher keys, maximizing the posterior simplifies to maximizing the likelihood $P(y \mid f)$, where $x = f^{-1}(y)$ is the proposed deciphered plaintext. The likelihood is evaluated using a Markov language model built from standard English corpora. 
+
+Because computing the exact MAP estimate across $28!$ states is computationally intractable, we approximate it using a Markov Chain Monte Carlo (MCMC) approach, specifically the Metropolis-Hastings algorithm. We construct a Markov chain whose stationary distribution is proportional to our target posterior distribution, $P(f \mid y)$. 
+
+The search proceeds as follows:
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Initialization:} We initialize the chain with a randomly generated permutation $f_0 \in \Omega$.
+    \item \textbf{Proposal Distribution:} At step $t$, we draw a candidate key $f'$ from a proposal distribution $q(f' \mid f_t)$. Our proposal mechanism is a simple transposition: we sample two distinct characters $i, j$ uniformly at random from the 28-character alphabet and swap their mappings. Because this proposal is symmetric (i.e., $q(f' \mid f_t) = q(f_t \mid f')$), the Hastings term cancels out.
+    \item \textbf{Acceptance Ratio:} The candidate state $f'$ is accepted with probability $\alpha$:
+    \begin{equation}
+        \alpha = \min\left(1, \frac{P(y \mid f')}{P(y \mid f_t)}\right)
+    \end{equation}
+    To prevent underflow errors during evaluation, the computation is performed strictly in log-space: $\log \alpha = \min(0, \ell(f') - \ell(f_t))$, where $\ell(\cdot)$ denotes the log-likelihood function.
+    \item \textbf{Exploration vs. Exploitation:} If $\log \alpha \geq 0$, the state is strictly better and is deterministically accepted. If $\log \alpha < 0$, the algorithm accepts the sub-optimal state with probability $e^{\log \alpha}$. This stochasticity is crucial, as it allows the chain to escape localized likelihood valleys.
+\end{enumerate}
+
+Throughout the random walk, the algorithm essentially performs a simulated annealing process without a cooling schedule. Instead of taking the final state of the chain, we maintain a global tracker that records the state yielding the highest historical log-likelihood. Time-bounding is enforced via the system clock, terminating the MCMC walk strictly before the autograder's execution constraints and returning the empirical MAP estimate found.
+
+\section{Enhancements Made to the Part I Solution}
+
+To elevate the decoding engine from a baseline proof-of-concept to a highly performant and robust system capable of near-deterministic convergence, we implemented several key architectural and theoretical enhancements.
+
+\subsection{High-Order Markov Language Models (N-Grams)}
+The baseline implementation relied exclusively on a first-order Markov assumption, evaluating transition probabilities $M_{i,j} = P(s_t \mid s_{t-1})$. While computationally inexpensive, a first-order model exhibits a relatively "flat" likelihood landscape, failing to capture the long-range dependencies and morphological structures inherent to the English language. This often resulted in the MCMC chain converging to pseudo-English local optima.
+
+To construct a steeper, more discriminative posterior landscape, we extended the likelihood function to incorporate third-order and fourth-order Markov dependencies (3-grams and 4-grams). Let $S = (s_1, \dots, s_N)$ be the proposed plaintext sequence. The composite log-likelihood is approximated as the sum of marginal and conditional probabilities up to the fourth order:
+\begin{equation}
+    \ell(f) \approx \log P(s_1) + \sum_{t=2}^{N} \log P(s_t \mid s_{t-1}) + \sum_{t=3}^N \log P(s_t \mid s_{t-1}, s_{t-2}) + \sum_{t=4}^N \log P(s_t \mid s_{t-1}, s_{t-2}, s_{t-3})
+\end{equation}
+
+Because standard external corpora primarily provide empirical counts for contiguous alphabetical sequences (omitting punctuation and spaces), integrating these directly would yield probabilities of $0$ (or $\log(0) \to -\infty$) for valid grammatical boundaries. To resolve this, we mathematically projected a base transition topology spanning the full 28-character set by chaining baseline 2-gram probabilities. We then normalized the empirical $n$-gram counts and interpolated them seamlessly into this multi-dimensional space, ensuring that valid inter-word boundaries were properly scored.
+
+\subsection{NumPy Vectorization of the Objective Function}
+In iterative MCMC methods, the time complexity is strictly dominated by the evaluation of the objective function at each proposal step. Profiling our initial Python implementation revealed that nested \texttt{for} loops traversing the proposed ciphertext array to calculate $\ell(f)$ were prohibitively slow. 
+
+We completely restructured the objective function using NumPy array vectorization and advanced indexing. By pre-computing the log-transition matrices and storing them densely in memory, calculating the entire sequence likelihood is reduced to slicing operations:
+\begin{equation}
+    \ell(f)_{\text{4-gram}} = \sum \mathbf{L}_{4g}\left[ x_{1:N-3}, x_{2:N-2}, x_{3:N-1}, x_{4:N} \right]
+\end{equation}
+Where $\mathbf{L}_{4g} \in \mathbb{R}^{28 \times 28 \times 28 \times 28}$ is our pre-compiled 4D log-probability tensor. This eliminated Python-level iteration overhead, delegating the bottleneck to highly optimized, continuous C-level memory blocks. This vectorization shifted our throughput from hundreds of iterations per second to tens of thousands, allowing drastically deeper exploration of the state space $\Omega$.
+
+\subsection{Radical Restarts to Escape Local Optima}
+While the Metropolis-Hastings acceptance criterion allows for occasional downward steps in likelihood, the chain can still become irrecoverably trapped in deep local optima---particularly when the proposed key correctly decodes $90\%$ of the text, but the remaining $10\%$ requires multiple simultaneous character transpositions that all individually penalize the score.
+
+To mitigate this, we implemented a deterministic bounds-checking mechanism parameterized by a \texttt{patience} threshold. If the MCMC algorithm executes a fixed number of proposal steps (e.g., $\tau = 2500$) without discovering a state that strictly dominates the global historic maximum likelihood, we force a completely randomized restart. The chain is asynchronously reinitialized at a new $f_0 \sim U(\Omega)$, discarding the current localized search but preserving the global \texttt{best\_state}. This effectively combines the local polish of Metropolis-Hastings with the global exploration properties of a randomized grid search.
+
+\section{Handling Breakpoints}
+
+The introduction of a structural breakpoint bifurcates the latent cipher mapping, radically expanding the state space constraint. The target parameter transitions from a single permutation $f \in \Omega$ to a composite tuple $\theta = (f_1, f_2, b)$, where $f_1, f_2 \in \Omega$ are independent substitution keys and $b \in [1, N]$ is the discrete index at which the cipher functions swap.
+
+\subsection{Piecewise Log-Likelihood}
+Assuming conditional independence between the sequence generated prior to the breakpoint and the sequence generated post-breakpoint (ignoring the marginal boundary $n$-gram spanning $b$), the joint log-likelihood function spatially segregates into two distinct evaluations:
+\begin{equation}
+    \ell(f_1, f_2, b) = \ell\left(f_1^{-1}(y_{1:b})\right) + \ell\left(f_2^{-1}(y_{b+1:N})\right)
+\end{equation}
+This piecewise likelihood inherently forces the MCMC algorithm to simultaneously optimize both keys while searching for the boundary that maximizes the sum of their individual language model scores.
+
+\subsection{Heterogeneous Proposal Distribution}
+Navigating the compound state space $\Omega \times \Omega \times [1,N]$ requires a carefully tuned proposal distribution. Updating all three parameters simultaneously would overwhelmingly result in catastrophic likelihood drops, causing the Metropolis-Hastings acceptance rate to plummet towards zero. Instead, we utilize a blockwise, randomized proposal schema---akin to a random-walk Metropolis-within-Gibbs sampler---which stochastically updates a singular component of the state tuple per iteration. 
+
+At each proposal step $t$, a uniform random variable $u \sim \text{U}(0,1)$ dictates the state perturbation:
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Optimize $f_1$ ($u < 0.45$):} Select two arbitrary characters uniformly and swap their mappings in $f_1$, holding $f_2$ and $b$ constant.
+    \item \textbf{Optimize $f_2$ ($0.45 \leq u < 0.90$):} Symmetrically swap a character mapping in $f_2$, holding $f_1$ and $b$ constant.
+    \item \textbf{Local Boundary Slide ($0.90 \leq u < 0.98$):} Perturb the breakpoint $b$ locally by walking an integer step sampled from a zero-mean Gaussian distribution, $\Delta b \sim \lfloor \mathcal{N}(0, \sigma^2) \rceil$. This simulates discrete gradient descent, smoothly dialing the boundary back and forth to find the exact cryptographic seam between the keys.
+    \item \textbf{Global Boundary Jump ($0.98 \leq u \leq 1.0$):} Sample a completely new breakpoint $b' \sim \text{U}(1, N)$. This heavy-tailed jump proposal prevents the boundary from becoming "pinched" in a local optimum near the beginning or end of the string, guaranteeing that the chain remains ergodic across the geometric parameter space.
+\end{itemize}
+
+By decoupling the proposals, the MCMC chain can gracefully slide the breakpoint $b$ across the sequence while independently "polishing" $f_1$ and $f_2$ in response to the shifting distributions of their respective subsequences.
+
+\section{Research and Development Process}
+
+The evolution of our decoding engine was driven by an iterative cycle of empirical profiling, bottleneck identification, and theoretical refinement.
+
+\subsection{Initial Profiling and Optimization Prioritization}
+Initial deployments of the baseline MCMC algorithm yielded suboptimal performance metrics, achieving approximately $63.8\%$ accuracy while frequently exhausting the 120-second execution bound on the remote autograder. Profiling revealed that the stochastic search itself was not inherently flawed, but rather starved of iterations. The sequential evaluation of transition probabilities in pure Python constituted a massive computational bottleneck. Consequently, our primary engineering focus abruptly shifted toward structural vectorization. By converting the objective function to utilize N-dimensional tensor operations via NumPy, we augmented the iteration throughput by orders of magnitude, effectively expanding the tractable search space within the strict temporal limits.
+
+\subsection{Iterative Statistical Tuning}
+With a vastly accelerated sampler, we observed that the chain occasionally converged with high confidence to text clusters resembling pseudo-grammatical English. This indicated that our prior distribution (the 2-gram transition topology) was insufficiently discriminative. To measure this, we systematically escalated the complexity of our Markov assumptions. We authored automated pipelines to parse and project massive 3-gram and 4-gram frequency distributions. By locally benchmarking convergence trajectories on truncated ciphertexts using \texttt{test.py}, we empirically determined that the computational overhead of evaluating a $28^4$ tensor at each step was inconsequential compared to the drastic reduction in iterations required to find the global optimum. The 4-gram constraint fundamentally eliminated convergence on localized gibberish.
+
+\subsection{Local Testing and Hyperparameter Search}
+To circumvent the latency of the remote evaluation queue, our agile development relied heavily on localized testing methodologies. We injected parameter overrides to constrain $10$- to $20$-second evaluation windows, allowing us to rapidly calibrate hyperparameters. Specifically, this environment was instrumental in tuning the \texttt{patience} parameter orchestrating our Radical Restarts. We charted the local optima entrapment rates against varied patience thresholds, empirically selecting a bound ($\tau \approx 2500$) that optimally balanced the exploitation of the Metropolis-Hastings gradients against the necessity of ergodic global leaps.
+
+\end{document}

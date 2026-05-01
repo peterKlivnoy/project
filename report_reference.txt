@@ -1,0 +1,122 @@
+================================================================================
+PART II WRITEUP - GROUND TRUTH REFERENCE DOCUMENT
+================================================================================
+
+This document contains the rigorous, factual methodology and development process 
+used in our final MCMC Decoder submission. Use this as the "ground truth" to 
+write your 2-3 page report.
+
+--------------------------------------------------------------------------------
+1. High-Level Overview of the Decoding Algorithm
+--------------------------------------------------------------------------------
+The core algorithm is a Markov Chain Monte Carlo (MCMC) search implementing the 
+Metropolis-Hastings algorithm to find the optimal substitution cipher key(s).
+
+- Objective Function: The algorithm evaluates the "fitness" of a proposed cipher key 
+  by calculating the log-likelihood of the decrypted text using Markov n-gram 
+  language models (incorporating 1-gram, 2-gram, 3-gram, and 4-gram distributions).
+- Proposal Step: During each iteration, the solver slightly mutates the current 
+  state. For a standard cipher, it randomly selects two decoded characters and 
+  swaps their mappings in the cipher key.
+- Acceptance Criterion: If the proposed decryption has a higher likelihood (more 
+  "English-like"), the new key is accepted automatically. If the likelihood is 
+  lower, it is accepted dynamically with a probability proportional to the 
+  likelihood ratio (np.exp(logalpha)), allowing the search to explore and escape 
+  minor valleys.
+- Global Tracking: The algorithm tracks the state that produced the highest 
+  historical log-likelihood over the entire run (best_log_lik and best_state) to 
+  ensure the final output represents the absolute maximum found.
+- Time Bound: The search uses a hard time boundary (e.g., max_time=110.0s) tied to 
+  the system clock to guarantee completion before Gradescope's strict 120s limit.
+
+--------------------------------------------------------------------------------
+2. Enhancements Made to the Part I Solution
+--------------------------------------------------------------------------------
+To achieve near-perfect decoding accuracy and maximize computation efficiency, 
+several massive overhauls were made to the baseline Part I approach:
+
+A. Multi-Dimensional N-Grams (3-Grams and 4-Grams)
+   - The Part I baseline relied on 2-gram (M) and 1-gram (P) probabilities. This 
+     was insufficient to confidently separate "mostly English" gibberish from 
+     true English, especially near breakpoints.
+   - We parsed massive external English character frequency datasets and projected 
+     them into 3D (28x28x28) and 4D (28x28x28x28) matrices.
+   - Mathematical Smoothing: Because the external n-gram datasets only considered 
+     letters (a-z) and omitted spaces and periods, we mathematically synthesized 
+     a baseline distribution by multiplying standard 2-gram probabilities 
+     [P(c4) ~ P(c1)*P(c2|c1)...]. We then normalized the true a-z n-gram counts 
+     to seamlessly overwrite this space, ensuring strings with spaces and periods 
+     did not result in negative-infinity log-likelihoods.
+
+B. Vectorized Log-Likelihood Evaluation (NumPy)
+   - Python `for` loops evaluating single transitions character-by-character were 
+     far too slow for MCMC. 
+   - We rewrote the likelihood function (`fast_log_likelihood`) using advanced 
+     NumPy array slicing / broadcasting. We evaluate thousands of N-gram lookups 
+     instantly via `np.sum(log_prob_4g[x[:-3], x[1:-2], x[2:-1], x[3:]])`.
+   - This shifted the computational bottleneck to compiled C-code natively in NumPy,
+     massively increasing the number of MCMC iterations possible per second.
+
+C. Radical Restarts (Escaping Local Optima)
+   - The MCMC can easily become trapped in "local optima" (e.g., getting stuck on 
+     a key that evaluates to highly-probable but incorrect words, where any single 
+     swap drops the score).
+   - We introduced a `patience` parameter limit. If `iters_since_improvement` hits 
+     the threshold (e.g., 2000-2500 steps without beating the all-time high score), 
+     the solver initiates a "Radical Restart"—completely scrambling the keys and 
+     teleporting the search to a random new point in the search space.
+
+--------------------------------------------------------------------------------
+3. Handling Breakpoints
+--------------------------------------------------------------------------------
+When a breakpoint is present (`has_breakpoint=True`), the search space expands 
+drastically. We must optimize a joint probability distribution over three variables: 
+the first cipher key (f1), the second cipher key (f2), and the breakpoint index (b).
+
+- Joint State Space: The MCMC tracks a tuple state: (f1, f2, b).
+- Segment Likelihoods: The log-likelihood evaluates the first text segment 
+  y[:b] using f1, and the second segment y[b:] using f2.
+- Heterogeneous Proposal Nudging: At each MCMC step, a random choice dictates how 
+  to mutate the state:
+    ~45% chance: Swap two elements in f1.
+    ~45% chance: Swap two elements in f2.
+    ~8% chance: Slightly nudge the breakpoint index `b` left or right smoothly 
+      using a Gaussian/Normal distribution (simulating a local search for b).
+    ~2% chance: Uniformly jump `b` to a completely new random location to broadly 
+      explore distinct macro-segments.
+- This joint optimization allows the MCMC to simultaneously polish the cipher keys 
+  and gracefully slide the breakpoint to the exact boundary where the character 
+  mapping shifts.
+
+--------------------------------------------------------------------------------
+4. Research & Development Process (R&D)
+--------------------------------------------------------------------------------
+A. Initial Bottleneck Identification
+   - Upon initial submission to Gradescope, our baseline MCMC scored ~0.638 on accuracy 
+     and frequently maxed out the computational time limit, indicating the search was 
+     getting trapped in local optima and evaluating states too slowly.
+
+B. Profiling & The Vectorization Shift
+   - We observed that computing thousands of `M[j, i]` lookups via nested standard 
+     Python structures was our core time sink. The focus shifted strictly to data 
+     engineering. Pre-compiling static matrices into `.npy` files and slicing them 
+     with NumPy allowed us to test exponentially more combinations per second.
+
+C. Statistical Tuning (The N-Gram Arms Race)
+   - We realized faster MCMC steps didn't matter if the 2-gram "landscape" was 
+     too flat. A flat landscape means bad ciphers score similarly to good ciphers, 
+     causing the algorithm to wander blindly.
+   - We wrote automated scripts (`build_3grams.py`, `build_4grams.py`) to inject 
+     increasing computational strictness. Upgrading to 3-grams dramatically steepened 
+     the slope towards correct English. Pushing to 4-grams forced the solver strictly 
+     into true valid syntax, sharply penalizing any non-English character patterns.
+
+D. Performance Measurement & Local Testing
+   - To rapidly iterate without waiting for the slow Gradescope server queue, 
+     we relied on the local `test.py` harness using a mock `dummy_text`.
+   - We adjusted the `max_time` parameter dynamically (lowering it to 10-20 seconds) 
+     for quick iterative debugging, verifying that the 3-gram and 4-gram integrations 
+     did not crash the matrix lookups on spaces/periods. 
+   - Ultimately, by profiling the time iteration trade-offs, we determined that the 
+     minor computation cost of evaluating a 4D NumPy matrix was entirely outweighed 
+     by the massive increase in search direction accuracy.
